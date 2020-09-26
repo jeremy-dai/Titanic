@@ -1,0 +1,684 @@
+---
+title: "Titanic: predicting the crash survivors"
+author: "Shota Gugushvili"
+date: June 9, 2020
+output:
+  tufte::tufte_html: default
+  tufte::tufte_handout: default
+bibliography: bib.bib
+link-citations: true
+---
+
+# Introduction
+
+`r tufte::newthought("Logistic regression")` is a popular technique for binary classification. The underlying model is an instance of a binomial GLM with a logit link function. The method takes its name from the logistic function, which is the inverse the logit. Given labels or outcomes (coded as $0$ and $1$) and the corresponding feature vectors, the task is, firstly, to train the classifier on the data at hand. Secondly, one wants to apply the trained classifier on new cases, where only the features are observed, with the goal of predicting the respective labels. Predictions are probabilistic: the model outputs probabilities for labels $0$ and  $1$. A new case is classified as belonging to class $1$ if the corresponding probability exceeds a specified threshold, e.g. $0.5$.
+
+Logistic regression comes in two brands: frequentist and Bayesian. The frequentist variety, where fitting is typically done via the maximum likelihood method, breaks down when the data are linearly separable. Surprisingly, this is a common enough occurence in practice. Bayesian approach, on the other hand, does not suffer from this drawback. This is due to the regularising effect of the prior on the likelihood. Additionally, prior allows one to incorporate any possible prior information on the model parameters, for instance from previous studies. Bayesian approach outputs posterior distribution on the parameters of the model. Prediction proceeds via the posterior predictive distribution by averaging the probability of class $1$ over the posterior distribution of the parameters. The end result is thresholded, as in the frequentist approach. See, e.g., [@rogers17] for an introduction to (Bayesian) logistic regression.
+
+In this report, Bayesian logistic regression will be applied on the Titanic dataset. The latter is a standard entry point to the Kaggle machine learning competitions^[See [https://www.kaggle.com/c/titanic](https://www.kaggle.com/c/titanic)]. Given passenger information, the task is to predict his/her survival. The enduring popularity of the problem is ensured by the topic itself: sinking of the Titanic in 1912 is one of the most infamous shipwrecks in history that has had a lasting cultural impact^[See [https://en.wikipedia.org/wiki/RMS_Titanic#Cultural](https://en.wikipedia.org/wiki/RMS_Titanic#Cultural)]. The disaster was met with shock and outrage at the shortcomings and failures that led to it and triggered major improvements in maritime safety.
+
+## Preliminaries
+
+`r tufte::newthought("I start")` with loading some packages and fixing settings, including the random seed for reproducibility.
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2) # Plotting
+library(tidyverse) # Data manipulation
+library(rstanarm) # Bayesian fitting with Stan
+library(bayesplot) # ggplot2-based package to plot MCMC results
+library(ggthemes) # Plotting themes
+library(viridis) # Colour schemes
+library(caret) # Accuracy tools and calibration
+library(precrec) # ROC curve
+library(missForest) # Missing values
+library(stringr) # String manipulation
+library(forcats) # Factors
+
+theme_set(theme_gdocs()) # ggplot2 theme
+bayesplot_theme_set(theme_gdocs()) # bayesplot theme
+
+color_scheme_set("viridisC") # viridis schemes are colourblind-friendly
+
+set.seed(123456)
+```
+
+## Data
+
+`r tufte::newthought("With the scenery")` set up, I can move to reading in the data.
+
+```{r}
+# Missing values: NA or whitespace
+
+df <- read.csv('titanic.csv', header = T, na.strings = c("", "NA", " "))
+
+glimpse(df) # Quick check
+```
+
+There are $891$ observations in total on $12$ variables. Of these, `PassengerId` is just an index. Names of other variables are mostly self-explanatory. I'll mention a few that are not:
+
+- `Pclass` stands for the class a passenger travelled.
+- `SibSp` and `Parch` indicate the numbers of siblings and parents a passenger travelled with.
+- `Fare` is the fare a passenger paid for his/her ticket.
+- `Embarked` supplies information on the port a passenger boarded the ship. The three letters `S`, `C` and `Q` encode Southampton, Cherbourg and Queenstown, respectively.
+
+## Data wrangling
+
+`r tufte::newthought("As a first step")`, I'll split the data into two sets: training set of $600$ observations and test set of $291$ observations. Classifier will be trained on the training data, while its performance will be evaluated on the test data.
+
+```{r}
+train_index <- sample(1:nrow(df), 600)
+
+train_df <- df[train_index, ]
+test_df <- df[-train_index, ]
+```
+
+The variable `Name` of itself is not be particularly useful for predicting survivors. However, from the glimpse at the data it is seen to contain titles of the passengers. These may be indicative of their social or demographic status and hence potentially useful for prediction. A new variable `Title` will be extracted from `Name` by matching a regular expression to the contents of the `Name` strings. This is easy, as titles end with a dot in the data file^[For data wrangling I'll mostly use `tidyverse`, though base **R** is of course an option too. For clarity, I'll avoid long pipes %>%. The resulting code is not always the most concise and elegant, but that's hopefully offset by its readability.].
+
+```{r}
+head(train_df[,"Name"]) # Last name - comma - whitespace - title - dot - whitespace - rest
+
+extract_title <- function(data){
+  data <- data %>%
+    tidyr::extract(col = Name, into = c("Title"), regex = "([^ ]+\\.)", remove = FALSE)
+  return(data)
+}
+
+train_df <- extract_title(train_df)
+test_df <- extract_title(test_df)
+```
+
+Now I'll summarise the title information.
+
+```{r}
+train_df %>%
+  select(Title) %>%
+  group_by(Title) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+
+test_df %>%
+  select(Title) %>%
+  group_by(Title) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+```
+
+Most passengers bear title `Mr.` Though they include some rare ones too (like `Jonkheer.`), titles are self-explanatory, except perhaps `Master.` A quick check shows that its bearers are boys too young to be called `Mr.`
+
+```{r}
+master_max <- train_df %>%
+  filter(Title == "Master.") %>%
+  summarise(max = max(Age, na.rm = TRUE))
+
+master_max
+```
+
+Logically, the same age girls should be carrying the title `Miss.` This is confirmed by the output of the next chunk, where I produced a histogram of the `Age` variable.
+
+```{r, fig.width=7.5, fig.height=5.5}
+train_df %>%
+  filter(Title == "Miss.") %>%
+  select(Age) %>%
+  ggplot(aes(Age)) +
+  geom_histogram(bins = 10)
+```
+
+Now a sensible idea is to recode `Master.`'s and titles of all passengers who are younger than $11$ to a new title, `Kids.` This specific value for the maximum age, $11$, comes from the training set. I'll use the same value for the test set as well.
+
+```{r}
+replace_kids <- function(data){
+  data <- data %>%
+    mutate(Title = replace(Title, Age <= master_max[[1]], "Kids.")) %>%
+    mutate(Title = as.factor(Title))
+  return(data)
+}
+
+train_df <- replace_kids(train_df)
+test_df <- replace_kids(test_df)
+```
+
+Let's check the result.
+
+```{r}
+train_df %>%
+  filter(Title == "Master.")
+
+test_df %>%
+  filter(Title == "Master.")
+```
+
+Uh oh, what happened? Why didn't all `Master.`'s get moved to `Kids.`? Well, some had their age missing in the dataset, that's why. I'll fix this manually now. I'll also simplify titles to four categories: `Men`, `Wo`, `Kids` and `Other`.
+
+```{r}
+# Group these together:
+# Mr. = Men
+# Miss., Mrs., Ms., Mlle., Mme. = Wo
+# Master., Kids. = Kids
+# Capt., Col., Don., Dr., Jonkheer., Lady., Major., Master., Rev., Sir., Countess. = Other
+
+# Remove Name
+
+# Warnings are okay: group_titles works for training and test sets
+
+group_titles <- function(data){
+  data <- data %>%
+    mutate(Title = fct_collapse(Title,
+                                "Men" = c("Mr."),
+                                "Kids" = c("Master.", "Kids."),
+                                "Wo" = c("Miss.", "Mrs.", "Ms.","Mlle.", "Mme."),
+                                "Other" = c("Capt.", "Col.", "Don.", "Dr.",
+                                            "Jonkheer.", "Lady.", "Major.", "Rev.",
+                                            "Sir.", "Countess.")
+                                )
+    ) %>%
+    select(-Name)
+  return(data)
+}
+
+train_df <- group_titles(train_df)
+test_df <- group_titles(test_df)
+```
+
+## Missing values
+
+`r tufte::newthought("As you saw above")`, I was too quick with manipulating data, but luckily managed to catch a problem with missing values. Now it's time to address the issue of missing values in a more thorough manner. First things first: which variables have missing values?
+
+```{r}
+missing_values <- function(data){
+  result <- data %>%
+    select_if(function(x){any(is.na(x))}) %>% 
+    summarise_all(list(~ sum(is.na(.))))
+  return(result)
+}
+
+missing_values(train_df)
+missing_values(test_df)
+```
+
+These are: `Age`, `Cabin` and `Embarked`. I'll start with missing values in `Embarked`, since there are only two missing values in the training and test sets. The chunk below shows that by far the most passengers boarded the Titanic in Southampton. This is a sensible choice to impute^[One may have noticed that both passengers travelled on the same ticket and in the same cabin, so they must have boarded the ship together. A Google search for their names reveals that one was a maid to another and they boarded the Titanic in Southampton. I didn't use this reasoning, though: it leaks information from the test set to the training set.].
+
+```{r}
+train_df %>%
+  filter(is.na(Embarked))
+
+test_df %>%
+  filter(is.na(Embarked))
+
+missing_embarked <- function(data){
+  result <- data %>%
+    mutate(Embarked = fct_explicit_na(Embarked)) %>%
+    select(Embarked) %>%
+    group_by(Embarked) %>%
+    summarise(n = n()) %>%
+    arrange(desc(n))
+  return(result)
+}
+
+missing_embarked(train_df)
+missing_embarked(test_df)
+
+train_df <- train_df %>% replace_na(list(Embarked = "S"))
+test_df <- test_df %>% replace_na(list(Embarked = "S"))
+```
+
+Next I'll take care of `Age`. One idea is to impute the overall mean or median age for missing values. But that's too crude. For instance, age distribution is different among passengers travelling different classes. See the boxplots below.
+
+```{r, fig.width=7.5, fig.height=5.5}
+train_df <- train_df %>%
+  mutate(Pclass = as.factor(Pclass))
+
+test_df <- test_df %>%
+  mutate(Pclass = as.factor(Pclass))
+
+train_df %>%
+  ggplot() +
+  geom_boxplot(aes(y = Age, x = Pclass)) 
+```
+
+I'll do something smarter and apply an iterative imputation method missForest based on a random forest; see [@stekhoven12]. But first let me perform a simple transformation: I'll combine `SibSp` and `Parch` to a new `FamSize` variable and categorise it to $4$ categories corresponding to passengers travelling alone, or together with a small, medium or large family. What these mean are my subjective choices, though not entirely arbitrary ones. For instance, the small and medium family categories allow to differentiate between couples travelling without children (perhaps elderly couples) and the ones with children.
+
+```{r}
+# Warnings are okay
+
+add_famsize <- function(data){
+  data <- data %>%
+    mutate(FamSize = as.factor(SibSp + Parch)) %>%
+    select(-SibSp, -Parch)
+  return(data)
+}
+
+train_df <- add_famsize(train_df)
+test_df <- add_famsize(test_df)
+
+levels(train_df$FamSize)
+
+famsize_relevel <- function(data){
+  data <- data %>%
+    mutate(FamSize = fct_collapse(FamSize,
+                                  "single" = c("0"),
+                                  "small" = c("1"),
+                                  "medium" = c("2", "3"),
+                                  "large" = c("4", "5", "6", "7", "8", "9", "10", "11",
+                                              "12", "13", "14", "15")
+                                  )
+           )
+  return(data)
+}
+
+train_df <- famsize_relevel(train_df)
+test_df <- famsize_relevel(test_df)
+```
+
+Next I'll drop a few variables that I won't use for prediction: `PassengerId`, `Cabin` and `Ticket`. Removing `PassengerId` raises no questions: it is an index, hence useless for prediction. On the other hand, if I knew the Titanic layout and its ticketing system, the two other variables may have yielded some valuable information. As I don't, I opted to simply drop them. Cabin has too many missing values for reliable imputation anyway.
+
+```{r}
+train_df <- train_df %>%
+  select(-Cabin, -PassengerId, -Ticket)
+
+test_df <- test_df %>%
+  select(-Cabin, -PassengerId, -Ticket)
+```
+
+Finally, I can impute the missing `Age` values. This is done separately for the training set and the test set. A simultaneous imputation would obviously improve the quality of imputed values, but would also leak information.
+
+```{r}
+train_df <- missForest(train_df)$ximp
+test_df <- missForest(test_df)$ximp
+```
+
+## Exploratory data analysis
+
+`r tufte::newthought("Time to move")` to exploratory data analysis. Which variables are useful for prediction? I'll make a few plots displaying survival percentages.
+
+Do women have higher survival rates than men? See the barchart below.
+
+```{r, fig.width=7.5, fig.height=5.5}
+totals_sex <- train_df %>%
+  select(Sex, Survived) %>%
+  group_by(Sex) %>%
+  count() %>%
+  ungroup()
+
+totals_sex
+
+survived_sex <- train_df %>%
+  filter(Survived == 1) %>%
+  select(Sex, Survived) %>%
+  group_by(Sex) %>%
+  count() %>%
+  ungroup()
+
+survived_sex
+
+sex_rate <- inner_join(survived_sex, totals_sex, by = "Sex") %>%
+  mutate(Percentage = n.x / n.y * 100) %>%
+  select(-n.x, -n.y)
+
+sex_rate
+
+ggplot(sex_rate, aes(x = Sex, y = Percentage)) +
+  geom_col() +
+  coord_flip() +
+  xlab("Sex") +
+  ylab("Survival percentage")
+```
+
+So `Sex` is a useful predictor. What about `Pclass`?
+
+```{r, fig.width=7.5, fig.height=5.5}
+totals_class <- train_df %>%
+  select(Pclass, Survived) %>%
+  group_by(Pclass) %>%
+  count() %>%
+  ungroup()
+
+totals_class
+
+survived_class <- train_df %>%
+  filter(Survived == 1) %>%
+  select(Pclass, Survived) %>%
+  group_by(Pclass) %>%
+  count() %>%
+  ungroup()
+
+survived_class
+
+class_rate <- inner_join(survived_class, totals_class, by = "Pclass") %>%
+  mutate(Percentage = n.x / n.y * 100) %>%
+  select(-n.x, -n.y)
+
+class_rate
+
+ggplot(class_rate, aes(x = Pclass, y = Percentage)) +
+  geom_col() +
+  coord_flip() +
+  xlab("Class") +
+  ylab("Survival percentage")
+```
+
+Aha, a higher class goes together with a higher survival percentage. So `Pclass` is useful too. The same can be said about `Fare`.
+
+```{r, fig.width=7.5, fig.height=5.5}
+fare_split <- function(x){
+  y <- x %/% 40
+  ifelse(y == 0, 0, ifelse(y == 1, 1, 2))
+}
+
+totals_fare <- train_df %>%
+  select(Fare) %>%
+  mutate(Fare = fare_split(Fare)) %>%
+  mutate(Fare = as_factor(Fare)) %>%
+  group_by(Fare) %>%
+  count() %>%
+  ungroup()
+
+totals_fare
+
+levels(totals_fare$Fare) <- c("0 - 40", "40 - 80", "> 80" )
+
+survived_fare <- train_df %>%
+  filter(Survived == 1) %>%
+  select(Fare) %>%
+  mutate(Fare = fare_split(Fare)) %>%
+  mutate(Fare = as_factor(Fare)) %>%
+  group_by(Fare) %>%
+  count() %>%
+  ungroup()
+
+levels(survived_fare$Fare) <- c("0 - 40", "40 - 80", "> 80" )
+
+survived_fare
+
+fare_rate <- inner_join(survived_fare, totals_fare, by = "Fare") %>%
+  mutate(Percentage = n.x / n.y * 100) %>%
+  select(-n.x, -n.y)
+
+fare_rate
+
+ggplot(fare_rate, aes(x = Fare, y = Percentage)) +
+  geom_col() +
+  coord_flip() +
+  ylab("Survival percentage")
+```
+
+That `Pclass` and `Fare` correlate should come as no surprise.
+
+```{r, fig.width=7.5, fig.height=5.5}
+train_df %>%
+  ggplot() +
+  geom_boxplot(aes(x = Pclass, y = Fare))
+```
+
+What about dependence of survival percentages on `Age`?
+
+```{r, fig.width=7.5, fig.height=5.5}
+totals_age <- train_df %>%
+  select(Age) %>%
+  mutate(Decade = (Age %/% 10) * 10) %>%
+  group_by(Decade) %>%
+  count() %>%
+  ungroup()
+
+totals_age
+
+survived_age <- train_df %>%
+  filter(Survived == 1) %>%
+  select(Age) %>%
+  mutate(Decade = (Age %/% 10) * 10) %>%
+  group_by(Decade) %>%
+  count() %>%
+  ungroup()
+
+survived_age
+
+train_df %>%
+  filter(Age >= 70 & Age < 80)
+
+survived_age <- survived_age %>%
+  add_row(Decade = 70, n = 0, .after = 7)
+
+survived_age
+
+age_rate <- inner_join(survived_age, totals_age, by = "Decade") %>%
+  mutate(Percentage = n.x / n.y * 100) %>%
+  select(-n.x, -n.y)
+
+age_rate <- age_rate %>%
+  mutate(Age = paste0(Decade," - ",Decade+10))
+
+age_rate
+
+ggplot(age_rate, aes(x = Age, y = Percentage)) +
+  geom_col() +
+  coord_flip() +
+  ylab("Survival percentage")
+```
+
+So children have a better survival percentage, which is in accordance with common sense. Results for the $70-80$ and $80-90$ categories may look peculiar. They aren't: there were only $5$ passengers aged $70-80$; none survived. And there was a single passenger older than $80$, who survived. That gave $0$ and $100\%$ survival percentages in the respective categories.
+
+Somewhat less obvious to guess is how the survival percentage relates to the family size. As the graph below shows, travelling with a small or medium-sized family appears to help.
+
+```{r, fig.width=7.5, fig.height=5.5}
+totals_famsize <- train_df %>%
+  select(FamSize) %>%
+  group_by(FamSize) %>%
+  count() %>%
+  ungroup()
+
+totals_famsize
+
+survived_famsize <- train_df %>%
+  filter(Survived == 1) %>%
+  select(FamSize) %>%
+  group_by(FamSize) %>%
+  count() %>%
+  ungroup()
+
+survived_famsize
+
+famsize_rate <- inner_join(survived_famsize, totals_famsize, by = "FamSize") %>%
+  mutate(Percentage = n.x / n.y * 100) %>%
+  select(-n.x, -n.y)
+
+famsize_rate
+
+ggplot(famsize_rate, aes(x = FamSize, y = Percentage)) +
+  geom_col() +
+  coord_flip() +
+  xlab("Family size") +
+  ylab("Survival percentage")
+```
+
+## Bayesian fitting with **rstanarm**
+
+`r tufte::newthought("Based on")` the exploratory data analysis, the following are the features I'll use for prediction: `Pclass`, `Title`, `Sex`, `Age`, `Fare`, `Embarked` and `FamSize`. Prior to training the model, it is advisable to standartise features. The following is a common choice from [@gelman08alone]:
+
+- Shift binary outputs to have mean $0$ and to differ by $1$ in their lower and upper conditions.
+- Shift other inputs to have mean $0$ and scale them to have standard deviation $1$. This puts continuous variables on the same scale as standartised binary inputs.
+
+I will not scale features manually, but let **rtsanarm** do the job for me by rescaling priors.
+
+Bayesian approach requires specification of the priors on the model parameters. The case of regression models is discussed by, among others, [@gelman08]. Assuming the features have been scaled, I'll use a weakly informative prior on the model coefficients. There is not much prior information on the parameters available anyway, but at the same time I want to avoid numerical instability caused by using flat priors. One possibility is the t-distribution with $7$ degrees of freedom and scale parameter $2.5$. This is reasonable in the situation when the coefficients should be close to zero, but also have some chance of being large. A slightly more conservative choice is the Cauchy, or t-distribution with $1$ degree of freedom, again with scale $2.5$. I'll start with that. As explained in [@gelman08], for the intercept term this prior might not make sense, so I'll go with a weaker choice for the constant term, Cauchy with scale $10.$
+
+With all the choices made, I'm ready to fit the model in **rtsanarm**. The MCMC algorithm used to that end is the No-U-Turn Sampler (NUTS), see [@hoffman14], a variant of the Hamiltonian Monte Carlo algorithm. By default, **rtsanarm** generates $2000$ posterior samples from $4$ Markov chains. The first half of generated chains is dropped as warm-up. No thinning is used by default.
+
+```{r}
+post1 <- stan_glm(Survived ~ Pclass + Title + Sex + Age + Fare + Embarked + FamSize,
+                  data = train_df,
+                  family = binomial(link = "logit"),
+                  seed = 1234,
+                  prior = cauchy(location = 0, scale = 2.5, autoscale = TRUE),
+                  prior_intercept = cauchy(location = 0, scale = 10, autoscale = TRUE),
+                  cores = 1,
+                  QR = FALSE)
+```
+
+I'll supply some MCMC convergence diagnostics at the end of this report. Here is a quick summary of the Monte Carlo run.
+
+```{r}
+post1
+```
+
+Posterior intervals can be extracted as follows (I use $80\%$ intervals^[Focussing on parameter `Age`, there seems to be a contradiction between the printed summary of `post1` and the output of `posterior_interval`. This, however, is purely optical and is entirely due to the round off in displayed results.]).
+
+```{r}
+round(posterior_interval(post1, prob = 0.8), 2)
+```
+
+There are a few things that can be said with a degree of certainty and that are in line with intuition. For instance, travelling second or third class decreases chances of survival: `Pclass1` is used as baseline, and with reference to that, credible intervals for coefficients `Pclass2` and `Pclass3` lie left to zero. Being a kid or a woman increases chances of survival: credible intervals of ` TitleKids` and `TitleWo` lie right to zero. And travelling with a large family is quite bad: see the credible interval for `FamSizelarge` (`FamSizeSingle` is the baseline).
+
+Of notice is that `Fare` has little or no effect on survival. One could guess that this is because its effect is sufficiently covered by other features. At any rate, one can drop `Fare` from the model and compare the reduced model to the original one via leave-one-out cross-validation.
+
+```{r}
+post2 <- update(post1, formula = Survived ~ . - Fare)
+
+loo1 <- loo(post1, cores = 1, save_psis = TRUE)
+loo2 <- loo(post2, cores = 1, save_psis = TRUE)
+
+loo_compare(loo1, loo2)
+```
+
+Model `post2` has the lowest LOO-CV score `looic` (equivalently, highest expected log predictive density `elpd_loo`). Based on this criterion, it is to be preferred to `post1`. The result appears to be sizable enough, though not decisive: the difference in the `elpd_loo` scores is a bit larger than one standard error of the difference. Finally, the Pareto $k$ diagnostic doesn't indicate reliability problems with the LOO-CV output^[For additional information and references on these topics see: [https://cran.r-project.org/web/packages/loo/vignettes/loo2-example.html](https://cran.r-project.org/web/packages/loo/vignettes/loo2-example.html)].
+
+```{r, fig.width=7.5, fig.height=5.5}
+print(loo1)
+print(loo2)
+
+plot(loo1)
+plot(loo2)
+```
+
+Parameters of `post2` are not too different from those of `post1`, so as to lead to different interpretations.
+
+```{r}
+post2
+
+round(posterior_interval(post2, prob = 0.8), 2)
+```
+
+## Prediction
+
+`r tufte::newthought("Time to evaluate")` predictive performance of my classifier on the test set. I'll use a threshold of $0.5$ when classifying into outcomes $1$ and $0$.
+
+```{r}
+preds2 <- posterior_linpred(post2, transform = TRUE, newdata = test_df)
+pred2 <- colMeans(preds2)
+pr2 <- as.integer(pred2 >= 0.5)
+
+confusionMatrix(as.factor(pr2), as.factor(test_df$Survived), positive = "1")
+```
+
+So I achieved the raw accuracy of $82\%$. Sensitivity and specificity are $0.72$ and $0.89$. These are reasonable. Sensitivity measures the ability of correctly classifying true positive cases (survivors, in present setting), while specificity does that for true negative cases. Thus my classifier is better at classifying non-survivors than survivors.
+
+Next I'll produce the ROC curve, which combines sensitivities and specificities for different thresholds into one graph. An algorithm based on random guessing would have the diagonal ROC curve, while the best algorithms would have ROC curves approaching the top left corner. A standard way of comparing ROC curves is by the areas underneath them. The AUC of my classifier is $0.84$, which indicates a fairly good discriminatory ability: if I pick a true survivor and a true non-survivor at random, there is an $84\%$ chance the classifier gives the true survivor a higher probability of surviving than the true non-survivor; cf. [@spiegelhalter19], page 159. A classifier based on random guessing has AUC equal to $0.5$.
+
+```{r, fig.width=7.5, fig.height=5.5}
+precrec_obj2 <- evalmod(mode = "rocprc",
+                        scores = pred2,
+                        labels = test_df$Survived) # Create ROC
+precrec_obj2
+
+a2 <- round(auc(precrec_obj2)[1,"aucs"], 2) # Extract AUC
+a2
+
+ssdf2 <- fortify(precrec_obj2) # Fortify precrec_obj2 for ggplot2
+
+ggplot(subset(ssdf2, curvetype == "ROC"), aes(x = x, y = y)) +
+  geom_line() +
+  xlab("1-Specificity") +
+  ylab("Sensitivity") +
+  ggtitle(paste0("ROC curve (AUC = ", a2,")"))
+```
+
+As a sanity check, I'll compare the logistic regression classifier to the following naive classifier:
+
+- All males have died.
+- All females have survived.
+
+```{r}
+test_df2 <- test_df %>%
+  mutate(Sex = ifelse(Sex == "female", 1, 0))
+
+confusionMatrix(as.factor(test_df2$Sex), as.factor(test_df$Survived), positive = "1")
+```
+
+At the very least I did better than this naive classifier.
+
+## Calibration plot
+
+`r tufte::newthought("AUC is one way")` to measure how well a classifier discriminates survivors and non-survivors. But the logistic regression classifier is a probabilistic one, and AUC doesn't show how good the probabilities are. Calibration plot is a simple, but useful tool to that end, see, e.g., [@spiegelhalter19], pages 159-163.
+
+In a nutshell, the idea is as follows: logistic regression classifier outputs probabilities of survival. In my case, there are $291$ values in total, one per each passenger in the test set. Bin these probabilities into deciles^[I'll do this and other computations from scratch. Note that the **caret** package furnishes an implementation of the calibration plot. The basic idea is the same as in my description. The main difference is that by default the data are split into roughly equal groups by their class probabilities.], and compute averages per each bin. These are average survival probabilities predicted by my classifier. I can compare these predicted probabilities to the ones actually observed in the test data by plotting predicted probabilities against observed ones in each bin. If points in the resulting graph lie near the diagonal line, predicted probabilities mean what they say: when the classifier tells me a certain group of passengers in the test data has a $30\%$ chance of survival, say, this matches what I observe in the data. To account for sampling variation, confidence intervals can be produced for observed probabilities. To that end, I'll employ the Agresti-Coull interval for the binomial proportion. The textbook interval based on the Normal approximation should not be used in practice at all, see [@brown01].
+
+The plot below shows the results^[I modified the code from: [https://darrendahly.github.io/post/homr/](https://darrendahly.github.io/post/homr/)]. Some explanations are in order. The rug plot at the top of the graph displays predicted probabilities before binning: each short vertical line corresponds to a passenger in the test set. This gives an idea how predicted probabilities are scattered over $[0,1]$, and whether, for instance, there are bins with too few points in them. Red dots visualise average predicted probabilities versus observed ones. As the Agresti-Coulli interval is not centred at the sample mean, red dots don't lie in the middle of red segments, which are $95\%$ Agresti-Coull confidence intervals.
+
+```{r, fig.width=7.5, fig.height=5.5}
+alpha <- 0.05
+z <- qnorm(1 - alpha/2)
+
+cal_plot2 <- data.frame(pred = pred2, obs = test_df$Survived)
+
+mutate(cal_plot2, bin = ntile(pred, 10)) %>%
+  group_by(bin) %>%
+  mutate(bin_pred = mean(pred),
+         bin_obs = mean(obs),
+         n = n(),
+         n_tilde = n + z^2,
+         bin_obs_tilde = (sum(obs) + z^2/2) / n_tilde,
+         se = sqrt((bin_obs_tilde * (1 - bin_obs_tilde)) / n_tilde),
+         ul = bin_obs_tilde + z * se,
+         ll = bin_obs_tilde - z * se) %>%
+  ungroup() %>%
+  ggplot(aes(x = bin_pred, y = bin_obs, ymin = ll, ymax = ul)) +
+  geom_pointrange(color = "red") +
+  geom_rug(aes(x = pred2), sides="t") +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.2)) +
+  # geom_abline(linetype = "dashed") +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), linetype = "dashed") +
+  xlab("Predicted probabilities") +
+  ylab("Observed probabilities")
+```
+
+Overall, the calibration plot says that my classifier performs reasonably well. Where it is less satisfactory is for a significant group of passengers, for which it gives a low survival probability: the actual survival rates are noticeably higher there^[Note, however, that performance of the Agresti-Coull interval for binomial proportion $p$ deteriorates somewhat when $p$ is close to zero or one.].
+
+## Recap
+
+`r tufte::newthought("In this report")`, I applied Bayesian logistic regression to classify survivors of the Titanic crash, given different kinds of information on passengers. The classifier achieved a decent performance, though it can be doubtless improved through a more careful feature engineering. Better accuracy can be attained with carefully tuned deep neural nets^[See the Kaggle competition results for the Titanic dataset. Note, however, that in this report I used far less data points to train the model than done there. That makes a difference.], but that's not straightforward. At the very least, logistic regression can serve as a useful benchmark for more modern and complex classifiers. The Titanic dataset is a toy one. In real applications, one would like to have a properly validated classifier, and in that respect playing with logistic regression on the Titanic data like I did in this report is not an idle exercise.
+
+## Convergence diagnostics
+
+`r tufte::newthought("For completeness")`, here are some MCMC convergence diagnostics for the `post2` run.
+
+Scale reduction factors are all close to $1$, which gives no indication of convergence problems.
+
+```{r}
+rhats <- rhat(post2)
+print(rhats)
+```
+
+The trace plots and autocorrelation plots also look healthy. Here they are for a few parameters.
+
+```{r, fig.width=7.5, fig.height=5.5}
+mcmc_trace(post2, pars = c("Pclass3", "TitleMen", "Sexmale", "FamSizelarge"))
+
+color_scheme_set("red")
+
+mcmc_acf_bar(post2, pars = c("Pclass3", "TitleMen", "Sexmale", "FamSizelarge"),
+             facet_args = list(labeller = ggplot2::label_parsed))
+```
+
+Pairs plots look fine too: no excessive correlation, banana-shaped bivariate posteriors and the likes.
+
+```{r, fig.width=7.5, fig.height=5.5}
+mcmc_pairs(post2,
+           pars = c("Pclass3", "TitleMen", "Sexmale", "FamSizelarge"),
+           off_diag_args = list(size = 1.5))
+```
+
+## Session information
+
+```{r}
+sessionInfo()
+```
+
